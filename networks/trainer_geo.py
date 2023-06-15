@@ -18,8 +18,9 @@ import logging
 import math
 
 from util.base_trainer import BaseTrainer
+from util.train_options import TrainOptions
 from dataloader.dataloader import TrainingImgDataset
-from network.arch import DiffPamirNet
+from network.arch import DiffPamirNet, PamirNet
 from neural_voxelization_layer.smpl_model import TetraSMPL
 from neural_voxelization_layer.voxelize import Voxelization
 from util.img_normalization import ImgNormalizerForResnet
@@ -71,7 +72,7 @@ class Trainer(BaseTrainer):
         self.pamir_net = DiffPamirNet().to(self.device)
 
         # diffusion
-        args = train_args()
+        args = TrainOptions().parse_args()
         self.diffusion = model_util.create_gaussian_diffusion(args)
 
         # optimizers
@@ -165,7 +166,7 @@ class Trainer(BaseTrainer):
         else:
             vol = self.voxelization(pred_vert_tetsmpl_gtshape_cam)
 
-        output_sdf = self.pamir_net(img, vol, pts, pts_proj, self.diffusion)
+        output_sdf = self.pamir_net(img, vol, pts, pts_proj, self.diffusion, self.device)
 
         losses['geo'] = self.geo_loss(output_sdf, gt_ov)
 

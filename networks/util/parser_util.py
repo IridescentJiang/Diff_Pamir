@@ -213,11 +213,8 @@ def get_cond_mode(args):
 
 def train_args():
     parser = ArgumentParser()
-    add_base_options(parser)
-    add_data_options(parser)
     add_model_options(parser)
     add_diffusion_options(parser)
-    add_training_options(parser)
     return parser.parse_args()
 
 

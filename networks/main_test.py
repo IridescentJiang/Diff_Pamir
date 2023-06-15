@@ -132,10 +132,10 @@ if __name__ == '__main__':
     #! Otherwise, use this function to predict and optimize a SMPL model for the input image
     main_test_wo_gt_smpl_with_optm(input_image_dir,
                                    output_dir,
-                                   pretrained_checkpoint='./results/pamir_geometry/checkpoints/latest.pt',
+                                   pretrained_checkpoint='./results/pamir_geometry/checkpoints/2023_06_14_23_49_18.pt',
                                    pretrained_gcmr_checkpoint='./results/gcmr_pretrained/gcmr_2020_12_10-21_03_12.pt')
 
     main_test_texture(output_dir,
                       output_dir,
-                      pretrained_checkpoint_pamir='./results/pamir_geometry/checkpoints/latest.pt',
+                      pretrained_checkpoint_pamir='./results/pamir_geometry/checkpoints/2023_06_14_23_49_18.pt',
                       pretrained_checkpoint_pamirtex='./results/pamir_texture/checkpoints/latest.pt')

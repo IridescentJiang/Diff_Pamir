@@ -215,7 +215,7 @@ class DiffPamirNet(BaseNetwork):
         self.feat_ch_3D = 32
         self.add_module('hg', hg2.HourglassNet(4, 3, 128, self.feat_ch_2D))
         self.add_module('ve', ve2.VolumeEncoder(3, self.feat_ch_3D))
-        self.add_module('mlp', MLP(self.feat_ch_2D + self.feat_ch_3D, 1, weight_norm=False))
+        self.add_module('mlp', MLP(self.feat_ch_2D + self.feat_ch_3D + 1, 1, weight_norm=False))
 
 
         logging.info('#trainable params of hourglass = %d' %
@@ -225,7 +225,7 @@ class DiffPamirNet(BaseNetwork):
         logging.info('#trainable params of mlp = %d' %
                      sum(p.numel() for p in self.mlp.parameters() if p.requires_grad))
 
-    def forward(self, img, vol, pts, pts_proj, diffusion):
+    def forward(self, img, vol, pts, pts_proj, diffusion, device):
         """
         img: [batchsize * 3 (RGB) * img_h * img_w]
         pts: [batchsize * point_num * 3 (XYZ)]
@@ -257,8 +257,13 @@ class DiffPamirNet(BaseNetwork):
             pt_feat, t = self.adding_noise(diffusion, pt_feat)
 
             # 将t拼接到feature中
-            embed_timestep = TimestepEmbedder(t.size(1), pt_feat.size(1))
-            emb = embed_timestep(t)
+            embed_timestep = TimestepEmbedder(t.size(0), pt_feat.size(0)).to(device)
+            # 得到 emb 张量维度为 [3]
+            emb = embed_timestep(t.float())
+            # 将 emb 张量在第0维上扩展为 [3, 1, 1, 1]
+            emb = emb.unsqueeze(1).unsqueeze(2).unsqueeze(3)
+            emb = emb.expand(3, 1, 5312, 1)
+            # 在第1维上将 emb 张量和 pt_feat 张量进行拼接
             pt_feat = torch.cat([emb, pt_feat], dim=1)
 
             pt_output = self.mlp(pt_feat)  # shape = [batch_size, channels, point_num, 1]
@@ -299,13 +304,8 @@ class DiffPamirNet(BaseNetwork):
             t, weights = schedule_sampler.sample(1, dist_util.dev())
         else:
             t, weights = schedule_sampler.sample(micro.shape[0], dist_util.dev())
-        x_t = self.q_sample(x_start, t, noise=noise)
+        x_t = diffusion.q_sample(x_start, t, noise=noise)
         return x_t, t
-
-    def forward(self, x):
-        # not used in the final model
-        x = x + self.pe[:x.shape[0], :]
-        return self.dropout(x)
 
 
 class TimestepEmbedder(nn.Module):
@@ -321,6 +321,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, timesteps):
         return self.mlp(timesteps)
+
 
 class PamirNetMultiview(BaseNetwork):
     def __init__(self):
