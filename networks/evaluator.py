@@ -18,7 +18,7 @@ import glob
 import logging
 import math
 
-from network.arch import PamirNet
+from network.arch import PamirNet, DiffPamirNet
 from neural_voxelization_layer.smpl_model import TetraSMPL
 from neural_voxelization_layer.voxelize import Voxelization
 from util.img_normalization import ImgNormalizerForResnet
@@ -28,6 +28,9 @@ from graph_cmr.models.geometric_layers import rodrigues, orthographic_projection
 import util.util as util
 import util.obj_io as obj_io
 import constant as const
+from diffusion.resample import create_named_schedule_sampler
+from util.train_options import TrainOptions
+import util.model_util as model_util
 
 
 class Evaluator(object):
@@ -58,13 +61,17 @@ class Evaluator(object):
                                          batch_size=1).to(self.device)
 
         # PIFU
-        self.pamir_net = PamirNet().to(self.device)
+        self.pamir_net = DiffPamirNet().to(self.device)
         self.models_dict = {'pamir_net': self.pamir_net}
         self.load_pretrained(checkpoint_file=pretrained_checkpoint)
         self.load_pretrained_gcmr(gcmr_checkpoint)
         self.graph_cnn.eval()
         self.smpl_param_regressor.eval()
         self.pamir_net.eval()
+
+        # diffusion
+        args = TrainOptions().parse_args()
+        self.diffusion = model_util.create_gaussian_diffusion(args)
 
     def load_pretrained(self, checkpoint_file=None):
         """Load a pretrained checkpoint.
@@ -313,4 +320,4 @@ class Evaluator(object):
         return pts_ov
 
     def forward_infer_occupancy_value(self, img, pts, pts_proj, vol):
-        return self.pamir_net(img, vol, pts, pts_proj)[-1]
+        return self.pamir_net(img, vol, pts, pts_proj, self.diffusion)[-1]

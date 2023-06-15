@@ -11,7 +11,6 @@ import logging
 import network.hg2 as hg2
 import network.ve2 as ve2
 import network.cg2 as cg2
-import diffusion.gaussian_diffusion as gaussian_diffusion
 from diffusion.resample import create_named_schedule_sampler
 from util import dist_util
 
