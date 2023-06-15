@@ -261,7 +261,7 @@ class DiffPamirNet(BaseNetwork):
             emb = embed_timestep(t.float())
             # 将 emb 张量在第0维上扩展为 [3, 1, 1, 1]
             emb = emb.unsqueeze(1).unsqueeze(2).unsqueeze(3)
-            emb = emb.expand(3, 1, 5312, 1)
+            emb = emb.expand(pt_feat.size(0), 1, pt_feat.size(2), pt_feat.size(3))
             # 在第1维上将 emb 张量和 pt_feat 张量进行拼接
             pt_feat = torch.cat([emb, pt_feat], dim=1)
 

@@ -320,4 +320,4 @@ class Evaluator(object):
         return pts_ov
 
     def forward_infer_occupancy_value(self, img, pts, pts_proj, vol):
-        return self.pamir_net(img, vol, pts, pts_proj, self.diffusion)[-1]
+        return self.pamir_net(img, vol, pts, pts_proj, self.diffusion, self.device)[-1]
