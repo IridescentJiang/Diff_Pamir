@@ -15,7 +15,7 @@ class TrainOptions(object):
         self.parser = argparse.ArgumentParser()
 
         req = self.parser.add_argument_group('Required')
-        req.add_argument('--name', required=True, help='Name of the experiment')
+        req.add_argument('--name', default='name', help='Name of the experiment')
 
         gen = self.parser.add_argument_group('General')
         gen.add_argument('--time_to_run', type=int, default=np.inf, help='Total time to run in seconds. Used for training in environments with timing constraints')
