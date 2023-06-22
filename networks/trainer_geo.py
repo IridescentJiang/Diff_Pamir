@@ -18,9 +18,8 @@ import logging
 import math
 
 from util.base_trainer import BaseTrainer
-from util.train_options import TrainOptions
 from dataloader.dataloader import TrainingImgDataset
-from network.arch import DiffPamirNet, PamirNet
+from network.arch import PamirNet
 from neural_voxelization_layer.smpl_model import TetraSMPL
 from neural_voxelization_layer.voxelize import Voxelization
 from util.img_normalization import ImgNormalizerForResnet
@@ -30,8 +29,6 @@ from graph_cmr.models.geometric_layers import rodrigues, orthographic_projection
 import util.obj_io as obj_io
 import util.util as util
 import constant as const
-import util.model_util as model_util
-from util.parser_util import train_args
 
 
 class Trainer(BaseTrainer):
@@ -69,11 +66,7 @@ class Trainer(BaseTrainer):
                                          batch_size=self.options.batch_size).to(self.device)
 
         # pamir_net
-        self.pamir_net = DiffPamirNet().to(self.device)
-
-        # diffusion
-        args = TrainOptions().parse_args()
-        self.diffusion = model_util.create_gaussian_diffusion(args)
+        self.pamir_net = PamirNet().to(self.device)
 
         # optimizers
         self.optm_pamir_net = torch.optim.RMSprop(
@@ -166,8 +159,7 @@ class Trainer(BaseTrainer):
         else:
             vol = self.voxelization(pred_vert_tetsmpl_gtshape_cam)
 
-        output_sdf = self.pamir_net(img, vol, pts, pts_proj, self.diffusion, self.device)
-
+        output_sdf = self.pamir_net(img, vol, pts, pts_proj)
         losses['geo'] = self.geo_loss(output_sdf, gt_ov)
 
         # calculates total loss
