@@ -9,6 +9,8 @@ import numpy as np
 import cv2 as cv
 import torch
 import torch.nn as nn
+import time
+import sys
 import torch.nn.functional as F
 from skimage import measure
 import scipy.io as sio
@@ -16,6 +18,7 @@ import datetime
 import glob
 import logging
 import math
+from tqdm import tqdm
 
 from util.base_trainer import BaseTrainer
 from dataloader.dataloader import TrainingImgDataset
@@ -29,6 +32,8 @@ from graph_cmr.models.geometric_layers import rodrigues, orthographic_projection
 import util.obj_io as obj_io
 import util.util as util
 import constant as const
+from util.data_loader import CheckpointDataLoader
+from diffusion.MLPdiffusion import MLPDiffusion
 
 
 class Trainer(BaseTrainer):
@@ -68,17 +73,26 @@ class Trainer(BaseTrainer):
         # pamir_net
         self.pamir_net = PamirNet().to(self.device)
 
+        # diffusion
+        num_step = 4000
+        self.diffusion_model = MLPDiffusion(num_step).to(self.device)
+
         # optimizers
         self.optm_pamir_net = torch.optim.RMSprop(
             params=list(self.pamir_net.parameters()), lr=float(self.options.lr)
+        )
+        self.optm_diffusion_model = torch.optim.RMSprop(
+            params=list(self.diffusion_model.parameters()), lr=float(self.options.lr)
         )
 
         # loses
         self.criterion_geo = nn.MSELoss().to(self.device)
 
         # Pack models and optimizers in a dict - necessary for checkpointing
-        self.models_dict = {'pamir_net': self.pamir_net}
-        self.optimizers_dict = {'optimizer_pamir_net': self.optm_pamir_net}
+        self.models_dict = {'pamir_net': self.pamir_net,
+                            'diffusion': self.diffusion_model}
+        self.optimizers_dict = {'optimizer_pamir_net': self.optm_pamir_net,
+                                'optimizer_diffusion_model': self.optm_diffusion_model}
 
         # Optionally start training from a pretrained checkpoint
         # Note that this is different from resuming training
@@ -100,6 +114,142 @@ class Trainer(BaseTrainer):
         now = datetime.datetime.now()
         self.log_file_path = os.path.join(
             self.options.log_dir, 'log_%s.npz' % now.strftime('%Y_%m_%d_%H_%M_%S'))
+
+        # diffusion
+        if self.checkpoint is None:
+            self.epoch_count_diff = 0
+            self.step_count_diff = 0
+        else:
+            self.epoch_count_diff = self.checkpoint['epoch_count_diff']
+            self.step_count_diff = self.checkpoint['step_count_diff']
+
+    def train(self):
+        """Training process."""
+        # Run training for num_epochs epochs
+        for epoch in tqdm(range(self.epoch_count, self.options.num_epochs), total=self.options.num_epochs, initial=self.epoch_count):
+            # Create new DataLoader every epoch and (possibly) resume
+            # from an arbitrary step inside an epoch
+            def worker_init_fn(worker_id):  # set numpy's random seed
+                seed = torch.initial_seed()
+                seed = seed % (2 ** 32)
+                np.random.seed(seed + worker_id)
+
+            self.start_epoch(epoch)
+            train_data_loader = CheckpointDataLoader(self.train_ds,checkpoint=self.checkpoint,
+                                                     dataset_perm=self.dataset_perm,
+                                                     batch_size=self.options.batch_size,
+                                                     num_workers=self.options.num_workers,
+                                                     pin_memory=self.options.pin_memory,
+                                                     shuffle=self.options.shuffle_train,
+                                                     worker_init_fn=worker_init_fn)
+
+            # Iterate over all batches in an epoch
+            for step, batch in enumerate(tqdm(train_data_loader, desc='Epoch '+str(epoch),
+                                              total=len(self.train_ds) // self.options.batch_size,
+                                              initial=train_data_loader.checkpoint_batch_idx),
+                                         train_data_loader.checkpoint_batch_idx):
+                if time.time() < self.endtime:
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k,v in batch.items()}
+                    out = self.train_step(batch)
+                    self.step_count += 1
+                    # Tensorboard logging every summary_steps steps
+                    if self.step_count % self.options.summary_steps == 0:
+                        self.train_summaries(batch, out)
+
+                    # Backup the current training stage
+                    if self.step_count % (self.options.summary_steps*10) == 0:
+                        self.saver.save_latest(
+                            self.models_dict, self.optimizers_dict, epoch, step + 1,
+                            self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                            self.step_count)
+
+                    # Save checkpoint every checkpoint_steps steps
+                    if self.step_count % self.options.checkpoint_steps == 0:
+                        self.saver.save_checkpoint(
+                            self.models_dict, self.optimizers_dict, epoch, step+1,
+                            self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                            self.step_count)
+                        tqdm.write('Checkpoint saved')
+
+                    # Run validation every test_steps steps
+                    if self.step_count % self.options.test_steps == 0:
+                        self.test()
+                else:
+                    tqdm.write('Timeout reached')
+                    self.saver.save_checkpoint(
+                        self.models_dict, self.optimizers_dict, epoch, step,
+                        self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                        self.step_count)
+                    tqdm.write('Checkpoint saved')
+                    sys.exit(0)
+
+            # load a checkpoint only on startup, for the next epochs
+            # just iterate over the dataset as usual
+            self.checkpoint=None
+            # save checkpoint after each epoch
+            if (epoch+1) % 10 == 0:
+                # self.saver.save_checkpoint(
+                # self.models_dict, self.optimizers_dict, epoch+1, 0, self.step_count)
+                self.saver.save_checkpoint(
+                    self.models_dict, self.optimizers_dict, epoch+1, 0, self.options.batch_size,
+                    None, self.step_count)
+
+        self.epoch_count_diff = self.epoch_count
+        self.step_count_diff = self.step_count
+        tqdm.write('Diffusion Training')
+        # run diffusion training
+        for epoch in tqdm(range(self.epoch_count_diff, self.options.num_epochs), total=self.options.num_epochs,
+                          initial=self.epoch_count_diff):
+            epoch_diff = epoch + self.epoch_count
+            for step, batch in enumerate(tqdm(train_data_loader, desc='Epoch ' + str(epoch_diff),
+                                              total=len(self.train_ds) // self.options.batch_size,
+                                              initial=train_data_loader.checkpoint_batch_idx),
+                                         train_data_loader.checkpoint_batch_idx):
+                if time.time() < self.endtime:
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k,v in batch.items()}
+                    out = self.train_step(batch)
+                    self.step_count_diff += 1
+                    # Tensorboard logging every summary_steps steps
+                    if self.step_count_diff % self.options.summary_steps == 0:
+                        self.train_summaries(batch, out)
+
+                    # Backup the current training stage
+                    if self.step_count_diff % (self.options.summary_steps*10) == 0:
+                        self.saver.save_latest(
+                            self.models_dict, self.optimizers_dict, epoch_diff, step + 1,
+                            self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                            self.step_count_diff)
+
+                    # Save checkpoint every checkpoint_steps steps
+                    if self.step_count_diff % self.options.checkpoint_steps == 0:
+                        self.saver.save_checkpoint(
+                            self.models_dict, self.optimizers_dict, epoch_diff, step+1,
+                            self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                            self.step_count_diff)
+                        tqdm.write('Checkpoint saved')
+
+                    # Run validation every test_steps steps
+                    if self.step_count_diff % self.options.test_steps == 0:
+                        self.test()
+                else:
+                    tqdm.write('Timeout reached')
+                    self.saver.save_checkpoint(
+                        self.models_dict, self.optimizers_dict, epoch_diff, step,
+                        self.options.batch_size, train_data_loader.sampler.dataset_perm,
+                        self.step_count_diff)
+                    tqdm.write('Checkpoint saved')
+                    sys.exit(0)
+            # load a checkpoint only on startup, for the next epochs
+            # just iterate over the dataset as usual
+            self.checkpoint = None
+            # save checkpoint after each epoch_diff
+            if (epoch_diff + 1) % 10 == 0:
+                # self.saver.save_checkpoint(
+                # self.models_dict, self.optimizers_dict, epoch_diff+1, 0, self.step_count_diff)
+                self.saver.save_checkpoint(
+                    self.models_dict, self.optimizers_dict, epoch_diff + 1, 0, self.options.batch_size,
+                    None, self.step_count_diff)
+        return
 
     def train_step(self, input_batch):
         self.pamir_net.train()
