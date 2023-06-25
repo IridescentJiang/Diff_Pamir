@@ -15,7 +15,7 @@ class TrainOptions(object):
         self.parser = argparse.ArgumentParser()
 
         req = self.parser.add_argument_group('Required')
-        req.add_argument('--name', default='name', help='Name of the experiment')
+        req.add_argument('--name', required=True, help='Name of the experiment')
 
         gen = self.parser.add_argument_group('General')
         gen.add_argument('--time_to_run', type=int, default=np.inf, help='Total time to run in seconds. Used for training in environments with timing constraints')
@@ -65,33 +65,6 @@ class TrainOptions(object):
         logging.add_argument('--debug', dest='debug', default=False, action='store_true', help='If set, debugging messages will be printed')
         logging.add_argument('--quiet', '-q', dest='quiet', default=False, action='store_true', help='If set, only warnings will be printed')
         logging.add_argument('--logfile', dest='logfile', default=None, help='If set, the log will be saved using the specified filename.')
-
-        diff = self.parser.add_argument_group('diffusion')
-        diff.add_argument("--noise_schedule", default='cosine', choices=['linear', 'cosine'], type=str,
-                           help="Noise schedule type")
-        diff.add_argument("--diffusion_steps", default=1000, type=int,
-                           help="Number of diffusion steps (denoted T in the paper)")
-        diff.add_argument("--sigma_small", default=True, type=bool, help="Use smaller sigma values.")
-
-        diff.add_argument("--arch", default='trans_enc',
-                           choices=['trans_enc', 'trans_dec', 'gru'], type=str,
-                           help="Architecture types as reported in the paper.")
-        diff.add_argument("--emb_trans_dec", default=False, type=bool,
-                           help="For trans_dec architecture only, if true, will inject condition as a class token"
-                                " (in addition to cross-attention).")
-        diff.add_argument("--layers", default=8, type=int,
-                           help="Number of layers.")
-        diff.add_argument("--latent_dim", default=512, type=int,
-                           help="Transformer/GRU width.")
-        diff.add_argument("--cond_mask_prob", default=.1, type=float,
-                           help="The probability of masking the condition during training."
-                                " For classifier-free guidance learning.")
-        diff.add_argument("--lambda_rcxyz", default=0.0, type=float, help="Joint positions loss.")
-        diff.add_argument("--lambda_vel", default=0.0, type=float, help="Joint velocity loss.")
-        diff.add_argument("--lambda_fc", default=0.0, type=float, help="Foot contact loss.")
-        diff.add_argument("--unconstrained", action='store_true',
-                           help="Model is trained unconditionally. That is, it is constrained by neither text nor action. "
-                                "Currently tested on HumanAct12 only.")
         return
 
     def parse_args(self):

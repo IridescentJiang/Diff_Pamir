@@ -11,8 +11,7 @@ import logging
 import network.hg2 as hg2
 import network.ve2 as ve2
 import network.cg2 as cg2
-from diffusion.resample import create_named_schedule_sampler
-from util import dist_util
+
 
 class BaseNetwork(nn.Module):
     def __init__(self):
@@ -179,7 +178,6 @@ class PamirNet(BaseNetwork):
                                        mode='bilinear', padding_mode='border')
             pt_feat_3D = pt_feat_3D.view([batch_size, -1, point_num, 1])
             pt_feat = torch.cat([pt_feat_2D, pt_feat_3D], dim=1)
-
             pt_output = self.mlp(pt_feat)  # shape = [batch_size, channels, point_num, 1]
             pt_output = pt_output.permute([0, 2, 3, 1])
             pt_sdf = pt_output.view([batch_size, point_num, 1])
@@ -201,125 +199,6 @@ class PamirNet(BaseNetwork):
             return f
         else:
             return self.ve(vol, intermediate_output=False)
-
-
-class DiffPamirNet(BaseNetwork):
-    """PIVOIF implementation with multi-stage output"""
-
-    def __init__(self):
-        super(DiffPamirNet, self).__init__()
-        # self.hg = hg.HourglassNet(4, 4, 128, 64)
-        # self.mlp = MLP()
-        self.feat_ch_2D = 256
-        self.feat_ch_3D = 32
-        self.add_module('hg', hg2.HourglassNet(4, 3, 128, self.feat_ch_2D))
-        self.add_module('ve', ve2.VolumeEncoder(3, self.feat_ch_3D))
-        self.add_module('mlp', MLP(self.feat_ch_2D + self.feat_ch_3D + 1, 1, weight_norm=False))
-
-
-        logging.info('#trainable params of hourglass = %d' %
-                     sum(p.numel() for p in self.hg.parameters() if p.requires_grad))
-        logging.info('#trainable params of 3d encoder = %d' %
-                     sum(p.numel() for p in self.ve.parameters() if p.requires_grad))
-        logging.info('#trainable params of mlp = %d' %
-                     sum(p.numel() for p in self.mlp.parameters() if p.requires_grad))
-
-    def forward(self, img, vol, pts, pts_proj, diffusion, device):
-        """
-        img: [batchsize * 3 (RGB) * img_h * img_w]
-        pts: [batchsize * point_num * 3 (XYZ)]
-        """
-        batch_size = pts.size()[0]
-        point_num = pts.size()[1]
-        img_feats = self.hg(img)
-        vol_feats = self.ve(vol)
-        img_feats = img_feats[-len(vol_feats):]
-        pt_sdf_list = []
-        h_grid = pts_proj[:, :, 0].view(batch_size, point_num, 1, 1)
-        v_grid = pts_proj[:, :, 1].view(batch_size, point_num, 1, 1)
-        grid_2d = torch.cat([h_grid, v_grid], dim=-1)
-        pts *= 2.0  # corrects coordinates for torch in-network sampling
-        x_grid = pts[:, :, 0].view(batch_size, point_num, 1, 1, 1)
-        y_grid = pts[:, :, 1].view(batch_size, point_num, 1, 1, 1)
-        z_grid = pts[:, :, 2].view(batch_size, point_num, 1, 1, 1)
-        grid_3d = torch.cat([x_grid, y_grid, z_grid], dim=-1)
-
-        for img_feat, vol_feat in zip(img_feats, vol_feats):
-            pt_feat_2D = F.grid_sample(input=img_feat, grid=grid_2d, align_corners=False,
-                                       mode='bilinear', padding_mode='border')
-            pt_feat_3D = F.grid_sample(input=vol_feat, grid=grid_3d, align_corners=False,
-                                       mode='bilinear', padding_mode='border')
-            pt_feat_3D = pt_feat_3D.view([batch_size, -1, point_num, 1])
-            pt_feat = torch.cat([pt_feat_2D, pt_feat_3D], dim=1)
-
-            # noise
-            pt_feat, t = self.adding_noise(diffusion, pt_feat)
-
-            # 将t拼接到feature中
-            embed_timestep = TimestepEmbedder(t.size(0), pt_feat.size(0)).to(device)
-            # 得到 emb 张量维度为 [3]
-            emb = embed_timestep(t.float())
-            # 将 emb 张量在第0维上扩展为 [3, 1, 1, 1]
-            emb = emb.unsqueeze(1).unsqueeze(2).unsqueeze(3)
-            emb = emb.expand(pt_feat.size(0), 1, pt_feat.size(2), pt_feat.size(3))
-            # 在第1维上将 emb 张量和 pt_feat 张量进行拼接
-            pt_feat = torch.cat([emb, pt_feat], dim=1)
-
-            pt_output = self.mlp(pt_feat)  # shape = [batch_size, channels, point_num, 1]
-            pt_output = pt_output.permute([0, 2, 3, 1])
-            pt_sdf = pt_output.view([batch_size, point_num, 1])
-            pt_sdf_list.append(pt_sdf)
-        return pt_sdf_list
-
-    def get_img_feature(self, img, no_grad=True):
-        if no_grad:
-            with torch.no_grad():
-                f = self.hg(img)[-1]
-            return f
-        else:
-            return self.hg(img)[-1]
-
-    def get_vol_feature(self, vol, no_grad=True):
-        if no_grad:
-            with torch.no_grad():
-                f = self.ve(vol, intermediate_output=False)
-            return f
-        else:
-            return self.ve(vol, intermediate_output=False)
-
-    def adding_noise(self, diffusion, x_start, micro=None):
-        """
-        Adding noise to features
-
-        :param diffusion: diffusion model
-        :param x_start: feature
-        :param micro: batch
-        :return:
-        """
-        noise = torch.randn_like(x_start)
-        schedule_sampler_type = 'uniform'
-        schedule_sampler = create_named_schedule_sampler(schedule_sampler_type, diffusion)
-        if micro is None:
-            t, weights = schedule_sampler.sample(1, dist_util.dev())
-        else:
-            t, weights = schedule_sampler.sample(micro.shape[0], dist_util.dev())
-        x_t = diffusion.q_sample(x_start, t, noise=noise)
-        return x_t, t
-
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, input_size, output_size):
-        super().__init__()
-        hidden_size = 3
-        # 定义多层感知机，将输入的尺寸从 input_size 转换为 output_size
-        self.mlp = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_size)
-        )
-
-    def forward(self, timesteps):
-        return self.mlp(timesteps)
 
 
 class PamirNetMultiview(BaseNetwork):
