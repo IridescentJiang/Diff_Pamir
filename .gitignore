@@ -10,3 +10,4 @@ __pycache__/
 results*/
 debug*/
 dataset_example/result/
+networks/logs/
