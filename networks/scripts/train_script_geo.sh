@@ -13,7 +13,7 @@ LOG_DIR='./results'
 DATASET_DIR='../dataset_example'
 VIEW_NUM_PER_ITEM=360
 POINT_NUM=5000
-NUM_EPOCHS=10
+NUM_EPOCHS=20
 SUMMARY_STEPS=20
 CHECKPOINTS_STEPS=20000
 TEST_STEPS=5000
@@ -37,4 +37,5 @@ CUDA_VISIBLE_DEVICES=${GPU_ID} python main_train.py \
 --checkpoint_steps ${CHECKPOINTS_STEPS} \
 --test_steps ${TEST_STEPS} \
 --num_workers ${NUM_WORKERS} \
---shuffle_train  --debug
+--shuffle_train  --debug 
+
