@@ -46,3 +46,62 @@ class MLPDiffusion(nn.Module):
         x = self.linears[-1](x)  # linear，保证x的形状不变
 
         return x
+
+    def p_sample_loop(self, shape, n_steps, betas, one_minus_alphas_bar_sqrt):
+        """从x[T]恢复x[T-1]、x[T-2]|...x[0]"""
+        cur_x = torch.randn(shape)
+        x_seq = [cur_x]
+        for i in reversed(range(n_steps)):
+            # 逆扩散过程是自回归的，即必须按顺序依次推出x[t],x[t-1],x[t-2]...
+            # 不能并行inference
+            cur_x = self.p_sample(cur_x, i, betas, one_minus_alphas_bar_sqrt)
+            x_seq.append(cur_x)
+        # 把很多步采样拼起来
+        return x_seq
+
+    def p_sample(self, x, t, betas, one_minus_alphas_bar_sqrt):  # 参数重整化的过程
+        """从x[t]采样t-1时刻的重构值，即从x[t]采样出x[t-1]"""
+        t = torch.tensor([t])
+
+        coeff = betas[t] / one_minus_alphas_bar_sqrt[t]
+
+        eps_theta = self.forward(x, t)
+
+        mean = (1 / (1 - betas[t]).sqrt()) * (x - (coeff * eps_theta))
+
+        # 得到mean后，再生成一个随机量z，
+        z = torch.randn_like(x)
+        sigma_t = betas[t].sqrt()
+
+        sample = mean + sigma_t * z
+        # 上面就单步采样
+        return (sample)
+
+    def diffusion_loss_fn(self, x_0, alphas_bar_sqrt, one_minus_alphas_bar_sqrt, n_steps):
+        """对任意时刻t进行采样计算loss"""
+        batch_size = x_0.shape[0]
+        # n_steps是为了算loss的时候，可以在n_steps这个范围内随机地生成一些t
+
+        # 对一个batchsize样本生成随机的时刻t,覆盖到更多不同的t
+        t = torch.randint(0, n_steps, size=(batch_size // 2,))  # size=(batch_size//2,)中的,不可少
+        t = torch.cat([t, n_steps - 1 - t], dim=0)  # [batchsize]
+        t = t.unsqueeze(-1)  # [batchsize, 1]
+
+        # x0的系数
+        a = alphas_bar_sqrt[t]
+
+        # eps的系数
+        aml = one_minus_alphas_bar_sqrt[t]
+
+        # 生成随机噪音eps
+        e = torch.randn_like(x_0)
+
+        # 构造模型的输入,即x_t可以用x_0和t来表示
+        x = x_0 * a + e * aml
+
+        # 送入模型，得到t时刻的随机噪声预测值
+        output = self.forward(x, t.squeeze(-1))
+
+        # 与真实噪声一起计算误差，求平均值
+        return (e - output).square().mean()
+        # 目的：让网络预测的噪声  接近于  真实扩散过程的噪声

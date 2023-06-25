@@ -74,8 +74,8 @@ class Trainer(BaseTrainer):
         self.pamir_net = PamirNet().to(self.device)
 
         # diffusion
-        num_step = 4000
-        self.diffusion_model = MLPDiffusion(num_step).to(self.device)
+        self.num_steps = 100 # 即T,对于步骤，一开始可以由beta, 分布的均值和标准差来共同确定
+        self.diffusion_model = MLPDiffusion(self.num_steps).to(self.device)
 
         # optimizers
         self.optm_pamir_net = torch.optim.RMSprop(
@@ -116,6 +116,26 @@ class Trainer(BaseTrainer):
             self.options.log_dir, 'log_%s.npz' % now.strftime('%Y_%m_%d_%H_%M_%S'))
 
         # diffusion
+        # 制定每一步的beta
+        self.betas = torch.linspace(-6, 6, self.num_steps)  # size:100
+        self.betas = torch.sigmoid(self.betas) * (0.5e-2 - 1e-5) + 1e-5
+        # beta是递增的，最小值为0.00001,最大值为0.005, sigmooid func
+        # 像学习率一样的一个东西，而且是一个比较小的值，所以就有理由假设逆扩散过程也是一个高斯分布
+
+        # 计算alpha、alpha_prod、alpha_prod_previous、alpha_bar_sqrt等变量的值
+        self.alphas = 1 - self.betas  # size: 100
+        self.alphas_prod = torch.cumprod(self.alphas, 0)  # size: 100
+        # 就是让每一个都错一下位
+        self.alphas_prod_p = torch.cat([torch.tensor([1]).float(), self.alphas_prod[:-1]], 0)  # p表示previous
+        # alphas_prod[:-1] 表示取出 从0开始到倒数第二个值
+        self.alphas_bar_sqrt = torch.sqrt(self.alphas_prod)
+        self.one_minus_alphas_bar_log = torch.log(1 - self.alphas_prod)
+        self.one_minus_alphas_bar_sqrt = torch.sqrt(1 - self.alphas_prod)
+
+        assert self.alphas.shape == self.alphas_prod.shape == self.alphas_prod_p.shape == \
+               self.alphas_bar_sqrt.shape == self.one_minus_alphas_bar_log.shape \
+               == self.one_minus_alphas_bar_sqrt.shape
+
         if self.checkpoint is None:
             self.epoch_count_diff = 0
             self.step_count_diff = 0
@@ -207,7 +227,7 @@ class Trainer(BaseTrainer):
                                          train_data_loader.checkpoint_batch_idx):
                 if time.time() < self.endtime:
                     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k,v in batch.items()}
-                    out = self.train_step(batch)
+                    out = self.train_step_diff(batch)
                     self.step_count_diff += 1
                     # Tensorboard logging every summary_steps steps
                     if self.step_count_diff % self.options.summary_steps == 0:
@@ -250,6 +270,114 @@ class Trainer(BaseTrainer):
                     self.models_dict, self.optimizers_dict, epoch_diff + 1, 0, self.options.batch_size,
                     None, self.step_count_diff)
         return
+
+    def train_step_diff(self, input_batch):
+        self.diffusion_model.train()
+        self.pamir_net.eval()  # lock BN and dropout
+        self.graph_cnn.eval()  # lock BN and dropout
+        self.smpl_param_regressor.eval()  # lock BN and dropout
+
+        # some constants
+        cam_f, cam_tz, cam_c = const.cam_f, const.cam_tz, const.cam_c
+        cam_r = torch.tensor([1, -1, -1], dtype=torch.float32).to(self.device)
+        cam_t = torch.tensor([0, 0, cam_tz], dtype=torch.float32).to(self.device)
+
+        # training data
+        img = input_batch['img']
+        pts = input_batch['pts']    # [:, :-self.options.point_num]
+        pts_proj = input_batch['pts_proj']  # [:, :-self.options.point_num]
+        gt_ov = input_batch['pts_ov']   # [:, :-self.options.point_num]
+        gt_betas = input_batch['betas']
+        gt_pose = input_batch['pose']
+        gt_scale = input_batch['scale']
+        gt_trans = input_batch['trans']
+        pts2smpl_idx = input_batch['pts2smpl_idx']  # [:, :-self.options.point_num]
+        pts2smpl_wgt = input_batch['pts2smpl_wgt']  # [:, :-self.options.point_num]
+
+        batch_size, pts_num = pts.size()[:2]
+        losses = dict()
+
+        # prepare gt variables
+        # convert to rotation matrices, add 180-degree rotation to root
+        gt_vert_cam = gt_scale * self.tet_smpl(gt_pose, gt_betas) + gt_trans
+
+        # gcmr body prediction
+        if not self.options.use_gt_smpl_volume:
+            with torch.no_grad():
+                pred_cam, pred_rotmat, pred_betas, pred_vert_sub, \
+                pred_vert, pred_vert_tetsmpl, pred_keypoints_2d = self.forward_gcmr(img)
+
+                # camera coordinate conversion
+                scale_, trans_ = self.forward_coordinate_conversion(
+                    pred_vert_tetsmpl, cam_f, cam_tz, cam_c, cam_r, cam_t, pred_cam, gt_trans)
+                # pred_vert_cam = scale_ * pred_vert + trans_
+                # pred_vert_tetsmpl_cam = scale_ * pred_vert_tetsmpl + trans_
+
+                pred_vert_tetsmpl_gtshape_cam = \
+                    scale_ * self.tet_smpl(pred_rotmat, pred_betas.detach()) + trans_
+
+            # randomly replace one predicted SMPL with ground-truth one
+            rand_id = np.random.randint(0, batch_size, size=[batch_size//3])
+            rand_id = torch.from_numpy(rand_id).long()
+            pred_vert_tetsmpl_gtshape_cam[rand_id] = gt_vert_cam[rand_id]
+
+            if self.options.use_adaptive_geo_loss:
+                pts = self.forward_warp_gt_field(
+                    pred_vert_tetsmpl_gtshape_cam, gt_vert_cam, pts, pts2smpl_idx, pts2smpl_wgt)
+
+        if self.options.use_gt_smpl_volume:
+            vol = self.voxelization(gt_vert_cam)
+        else:
+            vol = self.voxelization(pred_vert_tetsmpl_gtshape_cam)
+
+        output_sdf = self.pamir_net(img, vol, pts, pts_proj)
+
+        # diffusion
+        loss = self.diffusion_model.diffusion_loss_fn(output_sdf, self.alphas_bar_sqrt,
+                                                      self.one_minus_alphas_bar_sqrt, self.num_steps)
+        self.optm_diffusion_model.zero_grad()
+        loss.backward()
+        # 对梯度进行clip ， 保证稳定性.
+        # 当神经网络深度逐渐增加，网络参数量增多的时候，反向传播过程中链式法则里的梯度连乘项数便会增多，
+        # 更易引起梯度消失和梯度爆炸。对于梯度爆炸问题，解决方法之一便是进行梯度剪裁，即设置一个梯度大小的上限。
+
+        # 梯度裁剪应该放在loss.backward()和optimizer.step()之间
+        # https://zhuanlan.zhihu.com/p/557949443
+        torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), 1.)
+        self.optm_diffusion_model.step()
+        # ema会导致在这个s的数据集上训练速度变慢，所以不用ema
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad:
+        #         param.data = ema(name, param.data)
+
+        x_seq = self.diffusion_model.p_sample_loop(output_sdf.shape, self.num_steps, self.betas, self.one_minus_alphas_bar_sqrt)
+
+        output_sdf = x_seq
+
+        losses['geo'] = self.geo_loss(output_sdf, gt_ov)
+
+        # calculates total loss
+        total_loss = 0
+        for ln in losses.keys():
+            w = self.loss_weights[ln] if ln in self.loss_weights else 1.0
+            total_loss += w * losses[ln]
+        losses.update({'total_loss': total_loss})
+
+        # Do backprop
+        self.optm_pamir_net.zero_grad()
+        total_loss.backward()
+        self.optm_pamir_net.step()
+
+        # save
+        self.write_logs(losses)
+
+        # update learning rate
+        if self.step_count % 10000 == 0:
+            learning_rate = self.options.lr * (0.9 ** (self.step_count//10000))
+            logging.info('Epoch %d, LR = %f' % (self.step_count, learning_rate))
+            for param_group in self.optm_pamir_net.param_groups:
+                param_group['lr'] = learning_rate
+        return losses
 
     def train_step(self, input_batch):
         self.pamir_net.train()
