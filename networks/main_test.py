@@ -137,5 +137,5 @@ if __name__ == '__main__':
 
     main_test_texture(output_dir,
                       output_dir,
-                      pretrained_checkpoint_pamir='./results/pamir_geometry/checkpoints/latest.pt',
+                      pretrained_checkpoint_pamir='./results/pamir_geometry/checkpoints/1_person_10_epochs.pt',
                       pretrained_checkpoint_pamirtex='./results/pamir_texture/checkpoints/latest.pt')

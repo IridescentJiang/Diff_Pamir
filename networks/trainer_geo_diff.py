@@ -105,6 +105,7 @@ class Trainer(BaseTrainer):
         # read energy weights
         self.loss_weights = {
             'geo': self.options.weight_geo,
+            'diff': 0.5,
         }
 
         logging.info('#trainable_params = %d' %
@@ -136,12 +137,16 @@ class Trainer(BaseTrainer):
                self.alphas_bar_sqrt.shape == self.one_minus_alphas_bar_log.shape \
                == self.one_minus_alphas_bar_sqrt.shape
 
+    def init_count(self):
+        super(BaseTrainer, self).__init__()
         if self.checkpoint is None:
             self.epoch_count_diff = 0
             self.step_count_diff = 0
         else:
-            self.epoch_count_diff = self.checkpoint['epoch_count_diff']
-            self.step_count_diff = self.checkpoint['step_count_diff']
+            self.epoch_count_diff = 0
+            self.step_count_diff = 0
+        #     self.epoch_count_diff = self.checkpoint['epoch_count_diff']
+        #     self.step_count_diff = self.checkpoint['step_count_diff']
 
     def train(self):
         """Training process."""
@@ -214,12 +219,24 @@ class Trainer(BaseTrainer):
                     self.models_dict, self.optimizers_dict, epoch+1, 0, self.options.batch_size,
                     None, self.step_count)
 
-        self.epoch_count_diff = self.epoch_count
-        self.step_count_diff = self.step_count
         tqdm.write('Diffusion Training')
         # run diffusion training
         for epoch in tqdm(range(self.epoch_count_diff, self.options.num_epochs), total=self.options.num_epochs,
                           initial=self.epoch_count_diff):
+            def worker_init_fn(worker_id):  # set numpy's random seed
+                seed = torch.initial_seed()
+                seed = seed % (2 ** 32)
+                np.random.seed(seed + worker_id)
+
+            self.start_epoch(epoch)
+            train_data_loader = CheckpointDataLoader(self.train_ds,checkpoint=self.checkpoint,
+                                                     dataset_perm=self.dataset_perm,
+                                                     batch_size=self.options.batch_size,
+                                                     num_workers=self.options.num_workers,
+                                                     pin_memory=self.options.pin_memory,
+                                                     shuffle=self.options.shuffle_train,
+                                                     worker_init_fn=worker_init_fn)
+
             epoch_diff = epoch + self.epoch_count
             for step, batch in enumerate(tqdm(train_data_loader, desc='Epoch ' + str(epoch_diff),
                                               total=len(self.train_ds) // self.options.batch_size,
@@ -227,7 +244,8 @@ class Trainer(BaseTrainer):
                                          train_data_loader.checkpoint_batch_idx):
                 if time.time() < self.endtime:
                     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k,v in batch.items()}
-                    out = self.train_step_diff(batch)
+                    with torch.autograd.set_detect_anomaly(True):
+                        out = self.train_step_diff(batch)
                     self.step_count_diff += 1
                     # Tensorboard logging every summary_steps steps
                     if self.step_count_diff % self.options.summary_steps == 0:
@@ -333,26 +351,30 @@ class Trainer(BaseTrainer):
         output_sdf = self.pamir_net(img, vol, pts, pts_proj)
 
         # diffusion
-        loss = self.diffusion_model.diffusion_loss_fn(output_sdf, self.alphas_bar_sqrt,
-                                                      self.one_minus_alphas_bar_sqrt, self.num_steps)
-        self.optm_diffusion_model.zero_grad()
-        loss.backward()
-        # 对梯度进行clip ， 保证稳定性.
-        # 当神经网络深度逐渐增加，网络参数量增多的时候，反向传播过程中链式法则里的梯度连乘项数便会增多，
-        # 更易引起梯度消失和梯度爆炸。对于梯度爆炸问题，解决方法之一便是进行梯度剪裁，即设置一个梯度大小的上限。
+        x_seq_list = []
+        for pt_sdf in output_sdf:
 
-        # 梯度裁剪应该放在loss.backward()和optimizer.step()之间
-        # https://zhuanlan.zhihu.com/p/557949443
-        torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), 1.)
-        self.optm_diffusion_model.step()
-        # ema会导致在这个s的数据集上训练速度变慢，所以不用ema
-        # for name, param in model.named_parameters():
-        #     if param.requires_grad:
-        #         param.data = ema(name, param.data)
+            losses['diff'] = self.diffusion_model.diffusion_loss_fn(pt_sdf, self.alphas_bar_sqrt,
+                                                          self.one_minus_alphas_bar_sqrt, self.num_steps)
+            # self.optm_diffusion_model.zero_grad()
+            # losses['diff'].backward(retain_graph=True)
+            # 对梯度进行clip ， 保证稳定性.
+            # 当神经网络深度逐渐增加，网络参数量增多的时候，反向传播过程中链式法则里的梯度连乘项数便会增多，
+            # 更易引起梯度消失和梯度爆炸。对于梯度爆炸问题，解决方法之一便是进行梯度剪裁，即设置一个梯度大小的上限。
 
-        x_seq = self.diffusion_model.p_sample_loop(output_sdf.shape, self.num_steps, self.betas, self.one_minus_alphas_bar_sqrt)
+            # 梯度裁剪应该放在loss.backward()和optimizer.step()之间
+            # https://zhuanlan.zhihu.com/p/557949443
+            # torch.nn.utils.clip_grad_norm_(self.diffusion_model.parameters(), 1.)
+            # self.optm_diffusion_model.step()
+            # ema会导致在这个s的数据集上训练速度变慢，所以不用ema
+            # for name, param in model.named_parameters():
+            #     if param.requires_grad:
+            #         param.data = ema(name, param.data)
 
-        output_sdf = x_seq
+            x_seq = self.diffusion_model.p_sample_loop(pt_sdf.shape, self.num_steps, self.betas, self.one_minus_alphas_bar_sqrt)
+            x_seq_list.append(x_seq[-1])
+
+        output_sdf = x_seq_list
 
         losses['geo'] = self.geo_loss(output_sdf, gt_ov)
 
@@ -365,8 +387,10 @@ class Trainer(BaseTrainer):
 
         # Do backprop
         self.optm_pamir_net.zero_grad()
+        self.optm_diffusion_model.zero_grad()
         total_loss.backward()
         self.optm_pamir_net.step()
+        self.optm_diffusion_model.step()
 
         # save
         self.write_logs(losses)
@@ -544,7 +568,7 @@ class Trainer(BaseTrainer):
         if self.options.use_multistage_loss:
             loss = 0
             for o in pred_ov:
-                loss += self.criterion_geo(o, gt_ov)
+                loss = loss + self.criterion_geo(o, gt_ov)
         else:
             loss = self.criterion_geo(pred_ov[-1], gt_ov)
         return loss

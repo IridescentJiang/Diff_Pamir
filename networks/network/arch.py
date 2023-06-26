@@ -181,6 +181,7 @@ class PamirNet(BaseNetwork):
             pt_output = self.mlp(pt_feat)  # shape = [batch_size, channels, point_num, 1]
             pt_output = pt_output.permute([0, 2, 3, 1])
             pt_sdf = pt_output.view([batch_size, point_num, 1])
+
             pt_sdf_list.append(pt_sdf)
         return pt_sdf_list
 

@@ -12,15 +12,15 @@ class MLPDiffusion(nn.Module):
         # nn.Sequential定义的网络中各层会按照定义的顺序进行级联，需要保证各层的输入和输出之间要衔接
         # nn.Sequential实现了forward()方法，因此可以直接通过x = self.combine(x)的方式实现forward
         # 而nn.ModuleList则没有顺序性要求，也没有forward()方法
-        self.linears = nn.ModuleList(
+        self.conv = nn.ModuleList(
             [
-                nn.Linear(2, num_units),
+                nn.Conv1d(in_channels=5312, out_channels=128, kernel_size=1),
                 nn.ReLU(),
-                nn.Linear(num_units, num_units),
+                nn.Conv1d(in_channels=128, out_channels=128, kernel_size=1),
                 nn.ReLU(),
-                nn.Linear(num_units, num_units),
+                nn.Conv1d(in_channels=128, out_channels=128, kernel_size=1),
                 nn.ReLU(),
-                nn.Linear(num_units, 2),  # input shape = output shape = 2
+                nn.Conv1d(in_channels=128, out_channels=5312, kernel_size=1),  # input shape = output shape = 2
             ]
         )
         # https://pytorch.org/docs/stable/generated/torch.nn.Embedding.html
@@ -32,6 +32,8 @@ class MLPDiffusion(nn.Module):
             ]
         )
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     def forward(self, x, t):
         # 训练的时候不是按顺序给的，是随机采样的，需要额外的时间信息
         # 也可以不用embedding,直接送T进去训练，但这种信息无法很好学到，embedding层会嵌入时间的信息，变成网络更容易理解的模式。
@@ -39,33 +41,34 @@ class MLPDiffusion(nn.Module):
         # x = x_0
         for idx, embedding_layer in enumerate(self.step_embeddings):
             t_embedding = embedding_layer(t)  # 把t编码为128维的embedding
-            x = self.linears[2 * idx](x)  # linear
-            x += t_embedding  # embedding是通过加法加进去的
-            x = self.linears[2 * idx + 1](x)  # relu
+            x = self.conv[2 * idx](x)  # conv
+            t_embedding = t_embedding.transpose(1, 2).contiguous()
+            x = x + t_embedding  # embedding是通过加法加进去的
+            x = self.conv[2 * idx + 1](x)  # relu
 
-        x = self.linears[-1](x)  # linear，保证x的形状不变
+        x = self.conv[-1](x)  # conv，保证x的形状不变
 
         return x
 
     def p_sample_loop(self, shape, n_steps, betas, one_minus_alphas_bar_sqrt):
         """从x[T]恢复x[T-1]、x[T-2]|...x[0]"""
-        cur_x = torch.randn(shape)
+        cur_x = torch.randn(shape).to(self.device)
         x_seq = [cur_x]
         for i in reversed(range(n_steps)):
             # 逆扩散过程是自回归的，即必须按顺序依次推出x[t],x[t-1],x[t-2]...
             # 不能并行inference
-            cur_x = self.p_sample(cur_x, i, betas, one_minus_alphas_bar_sqrt)
+            cur_x = self.p_sample(cur_x, i, betas.to(self.device), one_minus_alphas_bar_sqrt.to(self.device))
             x_seq.append(cur_x)
         # 把很多步采样拼起来
         return x_seq
 
     def p_sample(self, x, t, betas, one_minus_alphas_bar_sqrt):  # 参数重整化的过程
         """从x[t]采样t-1时刻的重构值，即从x[t]采样出x[t-1]"""
-        t = torch.tensor([t])
+        t = torch.tensor([t]).to(self.device)
 
-        coeff = betas[t] / one_minus_alphas_bar_sqrt[t]
+        coeff = (betas[t] / one_minus_alphas_bar_sqrt[t]).to(self.device)
 
-        eps_theta = self.forward(x, t)
+        eps_theta = self.forward(x, t.unsqueeze(-1))
 
         mean = (1 / (1 - betas[t]).sqrt()) * (x - (coeff * eps_theta))
 
@@ -85,16 +88,16 @@ class MLPDiffusion(nn.Module):
         # 对一个batchsize样本生成随机的时刻t,覆盖到更多不同的t
         t = torch.randint(0, n_steps, size=(batch_size // 2,))  # size=(batch_size//2,)中的,不可少
         t = torch.cat([t, n_steps - 1 - t], dim=0)  # [batchsize]
-        t = t.unsqueeze(-1)  # [batchsize, 1]
+        t = t.unsqueeze(-1).unsqueeze(-1).to(self.device)  # [batchsize, 1, 1]
 
         # x0的系数
-        a = alphas_bar_sqrt[t]
+        a = alphas_bar_sqrt[t].to(self.device)
 
         # eps的系数
-        aml = one_minus_alphas_bar_sqrt[t]
+        aml = one_minus_alphas_bar_sqrt[t].to(self.device)
 
         # 生成随机噪音eps
-        e = torch.randn_like(x_0)
+        e = torch.randn_like(x_0).to(self.device)
 
         # 构造模型的输入,即x_t可以用x_0和t来表示
         x = x_0 * a + e * aml

@@ -28,6 +28,7 @@ from graph_cmr.models.geometric_layers import rodrigues, orthographic_projection
 import util.util as util
 import util.obj_io as obj_io
 import constant as const
+from diffusion.MLPdiffusion import MLPDiffusion
 
 
 class Evaluator(object):
@@ -57,14 +58,40 @@ class Evaluator(object):
                                          smooth_kernel_size=const.smooth_kernel_size,
                                          batch_size=1).to(self.device)
 
+        # Diffusion
+        self.num_steps = 100 # 即T,对于步骤，一开始可以由beta, 分布的均值和标准差来共同确定
+        self.diffusion_model = MLPDiffusion(self.num_steps).to(self.device)
+        self.diffusion_model.eval()
+        # 制定每一步的beta
+        self.betas = torch.linspace(-6, 6, self.num_steps)  # size:100
+        self.betas = torch.sigmoid(self.betas) * (0.5e-2 - 1e-5) + 1e-5
+        # beta是递增的，最小值为0.00001,最大值为0.005, sigmooid func
+        # 像学习率一样的一个东西，而且是一个比较小的值，所以就有理由假设逆扩散过程也是一个高斯分布
+
+        # 计算alpha、alpha_prod、alpha_prod_previous、alpha_bar_sqrt等变量的值
+        self.alphas = 1 - self.betas  # size: 100
+        self.alphas_prod = torch.cumprod(self.alphas, 0)  # size: 100
+        # 就是让每一个都错一下位
+        self.alphas_prod_p = torch.cat([torch.tensor([1]).float(), self.alphas_prod[:-1]], 0)  # p表示previous
+        # alphas_prod[:-1] 表示取出 从0开始到倒数第二个值
+        self.alphas_bar_sqrt = torch.sqrt(self.alphas_prod)
+        self.one_minus_alphas_bar_log = torch.log(1 - self.alphas_prod)
+        self.one_minus_alphas_bar_sqrt = torch.sqrt(1 - self.alphas_prod)
+
+        assert self.alphas.shape == self.alphas_prod.shape == self.alphas_prod_p.shape == \
+               self.alphas_bar_sqrt.shape == self.one_minus_alphas_bar_log.shape \
+               == self.one_minus_alphas_bar_sqrt.shape
+
+
         # PIFU
         self.pamir_net = PamirNet().to(self.device)
-        self.models_dict = {'pamir_net': self.pamir_net}
+        self.models_dict = {'pamir_net': self.pamir_net, 'diffusion': self.diffusion_model}
         self.load_pretrained(checkpoint_file=pretrained_checkpoint)
         self.load_pretrained_gcmr(gcmr_checkpoint)
         self.graph_cnn.eval()
         self.smpl_param_regressor.eval()
         self.pamir_net.eval()
+
 
     def load_pretrained(self, checkpoint_file=None):
         """Load a pretrained checkpoint.
@@ -307,6 +334,9 @@ class Evaluator(object):
             pts_proj_group = pts_proj[:, (gi * group_size):((gi + 1) * group_size), :]
             outputs = self.forward_infer_occupancy_value(
                 img, pts_group, pts_proj_group, vol)
+            x_seq = self.diffusion_model.p_sample_loop(outputs.shape, self.num_steps, self.betas,
+                                                           self.one_minus_alphas_bar_sqrt)
+            outputs = x_seq[-1]
             pts_ov.append(np.squeeze(outputs.detach().cpu().numpy()))
         pts_ov = np.concatenate(pts_ov)
         pts_ov = np.array(pts_ov)

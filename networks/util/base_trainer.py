@@ -26,11 +26,13 @@ class BaseTrainer(object):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # override this function to define your model, optimizers etc.
         self.dataset_perm = None
-        self.init_fn()
+
         self.saver = CheckpointSaver(save_dir=options.checkpoint_dir)
         self.summary_writer = SummaryWriter(self.options.summary_dir)
+        self.init_fn()
 
         self.checkpoint = None
+
         if self.options.resume and self.saver.exists_checkpoint():
             self.checkpoint = self.saver.load_checkpoint(
                 self.models_dict, self.optimizers_dict, checkpoint_file=self.options.checkpoint)
@@ -41,6 +43,10 @@ class BaseTrainer(object):
         else:
             self.epoch_count = self.checkpoint['epoch']
             self.step_count = self.checkpoint['total_step_count']
+
+        self.init_count()
+
+
 
     def load_pretrained(self, checkpoint_file=None):
         """Load a pretrained checkpoint.
